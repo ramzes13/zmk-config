@@ -8,8 +8,10 @@
 
         default_layer { // Layer 0
             bindings = <
-                &kp Q &rgb_ug RGB_COLOR_HSB(128,100,100)
-                &rgb_ug RGB_OFF &rgb_ug RGB_ON
+                &kp A  &kp S  &rgb_ug RGB_SPI  &rgb_ug RGB_SPD  &rgb_ug RGB_TOG
+                &kp Z  &kp X  &rgb_ug RGB_BRI  &rgb_ug RGB_EFR  &rgb_ug RGB_COLOR_HSB(0,100,100)
+                &kp U  &kp I  &rgb_ug RGB_BRD  &rgb_ug RGB_EFF  &rgb_ug RGB_COLOR_HSB(128,100,100)
+                &kp Q  &kp E  &kp R
             >;
         };
     };
