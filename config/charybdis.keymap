@@ -23,6 +23,11 @@
         compatible = "zmk,input-listener";
         device = <&trackball_split>;
 
+        default {
+            layers = <Media>;  // Default mouse movement on Media layer
+            input-processors = <&zip_xy_scaler 1 3>;
+        };
+
         snipe {
             layers = <Mouse>;
             input-processors = <&zip_xy_scaler 1 3>;
