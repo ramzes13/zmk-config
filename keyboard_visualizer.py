@@ -18,10 +18,11 @@ import sys
 import re
 import os
 import select
+import time
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QShortcut,
+    QPushButton, QLabel, QShortcut, QTextEdit,
 )
 from PyQt5.QtCore import Qt, QRect, QFileSystemWatcher, QRectF, QThread, pyqtSignal
 from PyQt5.QtGui import QKeySequence as QKS
@@ -146,6 +147,24 @@ def parse_binding(raw: str):
         return fmt_key(key), f"[{layer_short(ln)}]", "layer", (
             f"Layer-tap\n  Tap  →  {fmt_key(key)}\n  Hold →  Layer {ln}: {lname}"
         )
+    _LTS_LAYER = {
+        "lts_media": 1, "lts_nav": 2, "lts_mouse": 3,
+        "lts_sym": 4,   "lts_num": 5,
+        "lts_fun": 6,   "lts_rgb": 8,
+    }
+    if b.startswith("&lts_"):
+        parts = b.split()
+        bname = parts[0][1:]  # strip &
+        ln = _LTS_LAYER.get(bname)
+        if ln is not None and len(parts) >= 3:
+            key = parts[2]   # parts[1] is the dummy 0
+            lname = LAYER_DEFS[ln][1] if ln < len(LAYER_DEFS) else f"L{ln}"
+            _LTS_SIGNAL_KEY = {1:"F20",2:"F21",3:"F22",4:"F23",5:"F24",6:"F13",8:"F14"}
+            sig = _LTS_SIGNAL_KEY.get(ln, f"F??")
+            return fmt_key(key), f"[{layer_short(ln)}]★", "layer", (
+                f"Signaled layer-tap\n  Tap  →  {fmt_key(key)}\n"
+                f"  Hold →  Layer {ln}: {lname}  (sends {sig} signal)"
+            )
     if b.startswith("&mo "):
         ln = int(b[4:].strip())
         lname = LAYER_DEFS[ln][1] if ln < len(LAYER_DEFS) else f"L{ln}"
@@ -274,6 +293,10 @@ if HAS_EVDEV:
         "F4":  EC.KEY_F4,  "F5":  EC.KEY_F5,  "F6":  EC.KEY_F6,
         "F7":  EC.KEY_F7,  "F8":  EC.KEY_F8,  "F9":  EC.KEY_F9,
         "F10": EC.KEY_F10, "F11": EC.KEY_F11, "F12": EC.KEY_F12,
+        "F13": EC.KEY_F13, "F14": EC.KEY_F14, "F15": EC.KEY_F15,
+        "F16": EC.KEY_F16, "F17": EC.KEY_F17, "F18": EC.KEY_F18,
+        "F19": EC.KEY_F19, "F20": EC.KEY_F20, "F21": EC.KEY_F21,
+        "F22": EC.KEY_F22, "F23": EC.KEY_F23, "F24": EC.KEY_F24,
         # Modifiers (for homerow-mod hold detection)
         "LGUI": EC.KEY_LEFTMETA,   "RGUI": EC.KEY_RIGHTMETA,
         "LALT": EC.KEY_LEFTALT,    "RALT": EC.KEY_RIGHTALT,
@@ -290,6 +313,18 @@ if HAS_EVDEV:
         "C_MENU": EC.KEY_MENU,
     }
 
+    # F20-F24 are sent by the layer-signal macros in ZMK when a thumb &lt
+    # hold is activated / released.  They map directly to layer indices.
+    LAYER_SIGNAL_CODES = {
+        EC.KEY_F13: 6,   # Fun   (&lts_fun  0 SLASH)
+        EC.KEY_F14: 8,   # RGB   (&lts_rgb  0 P)
+        EC.KEY_F20: 1,   # Media (&lts_media 0 ESCAPE)
+        EC.KEY_F21: 2,   # Nav   (&lts_nav  0 TAB)
+        EC.KEY_F22: 3,   # Mouse (&lts_mouse 0 SPACE)
+        EC.KEY_F23: 4,   # Sym   (&lts_sym  0 BACKSPACE)
+        EC.KEY_F24: 5,   # Num   (&lts_num  0 ENTER)
+    }
+
     def binding_to_evdev_codes(binding: str) -> list:
         """Return list of evdev keycodes a binding can produce (tap + hold)."""
         b = binding.strip()
@@ -300,9 +335,10 @@ if HAS_EVDEV:
                 codes.append(c)
         elif b.startswith("&hm "):
             parts = b[4:].split()
-            # tap → key, hold → modifier
-            for k in [parts[1], parts[0]]:
-                c = ZMK_TO_EVDEV.get(k)
+            # Only the tap key — modifier hold is resolved by ZMK already,
+            # and tracked separately via build_mod_hold_map.
+            if len(parts) >= 2:
+                c = ZMK_TO_EVDEV.get(parts[1])
                 if c is not None:
                     codes.append(c)
         elif b.startswith("&lt "):
@@ -310,6 +346,13 @@ if HAS_EVDEV:
             c = ZMK_TO_EVDEV.get(parts[1])
             if c is not None:
                 codes.append(c)
+        elif b.startswith("&lts_"):
+            # &lts_media 0 ESCAPE — tap key is parts[2] (skip dummy 0)
+            parts = b.split()
+            if len(parts) >= 3:
+                c = ZMK_TO_EVDEV.get(parts[2])
+                if c is not None:
+                    codes.append(c)
         elif b in ("&undo", "&cut", "&copy", "&paste", "&select_all"):
             # macros use ctrl combos; ctrl and the letter both fire
             macro_keys = {
@@ -331,6 +374,30 @@ if HAS_EVDEV:
                 if code not in result:
                     result[code] = idx
         return result
+
+    def build_mod_hold_map(bindings: list) -> dict:
+        """modifier_evdev_code → key_index for &hm holds.
+        Only includes modifiers that are unique to a single physical key so we
+        can unambiguously highlight the correct key (e.g. LGUI→A is unique,
+        but LCTRL is shared by D and Z so it's excluded)."""
+        mod_to_indices: dict = {}
+        for idx, raw in enumerate(bindings):
+            b = raw.strip()
+            if b.startswith("&hm "):
+                parts = b[4:].split()
+                if len(parts) >= 1:
+                    mod_code = ZMK_TO_EVDEV.get(parts[0])
+                    if mod_code is not None:
+                        mod_to_indices.setdefault(mod_code, []).append(idx)
+        # Drop any modifier that maps to more than one physical key
+        return {code: idxs[0] for code, idxs in mod_to_indices.items() if len(idxs) == 1}
+
+    def _evdev_name(code: int) -> str:
+        """Human-readable name for a raw evdev keycode."""
+        raw = EC.KEY.get(code, f"#{code}")
+        if isinstance(raw, list):
+            raw = raw[0]
+        return raw.replace("KEY_", "")
 
     class KeyListener(QThread):
         """Background thread: reads evdev events and emits key_event signals."""
@@ -398,8 +465,9 @@ class Key(QWidget):
         self.main     = ""
         self.sub      = ""
         self.ktype    = "normal"
-        self._hovered = False
-        self._pressed = False
+        self._hovered  = False
+        self._pressed  = False
+        self._mod_held = False
         self.setMouseTracking(True)
 
     def set_binding(self, main, sub, ktype, tip):
@@ -412,6 +480,11 @@ class Key(QWidget):
             self._pressed = pressed
             self.update()
 
+    def set_mod_held(self, held: bool):
+        if self._mod_held != held:
+            self._mod_held = held
+            self.update()
+
     def enterEvent(self, _): self._hovered = True;  self.update()
     def leaveEvent(self, _): self._hovered = False; self.update()
 
@@ -420,7 +493,10 @@ class Key(QWidget):
         bg = QColor(bg_hex)
         fg = QColor(fg_hex)
 
-        if self._pressed:
+        if self._mod_held:
+            bg = bg.lighter(220)
+            bg = QColor(min(255, bg.red() + 90), max(0, bg.green() - 20), max(0, bg.blue() - 20))
+        elif self._pressed:
             bg = bg.lighter(280)
         elif self._hovered:
             bg = bg.lighter(150)
@@ -446,8 +522,10 @@ class Key(QWidget):
         gloss.setColorAt(1, QColor(255, 255, 255, 0))
         p.fillPath(face, QBrush(gloss))
 
-        # Border — bright glow when pressed
-        if self._pressed:
+        # Border — bright glow when pressed or mod held
+        if self._mod_held:
+            p.setPen(QPen(QColor(255, 100, 80, 220), 2.5))
+        elif self._pressed:
             p.setPen(QPen(QColor(255, 240, 160, 230), 2.5))
         elif self._hovered:
             p.setPen(QPen(QColor(255, 255, 255, 55), 1.2))
@@ -456,7 +534,7 @@ class Key(QWidget):
         p.drawPath(face)
 
         # Text
-        p.setPen(fg if not self._pressed else QColor(20, 20, 20))
+        p.setPen(fg if not (self._pressed or self._mod_held) else QColor(20, 20, 20))
         if self.sub:
             font = QFont("Monospace", 10, QFont.Bold)
             p.setFont(font)
@@ -464,7 +542,7 @@ class Key(QWidget):
             p.drawText(top_rect, Qt.AlignHCenter | Qt.AlignVCenter, self.main)
             font2 = QFont("Monospace", 7)
             p.setFont(font2)
-            p.setPen(fg.darker(150) if not self._pressed else QColor(40, 40, 40))
+            p.setPen(fg.darker(150) if not (self._pressed or self._mod_held) else QColor(40, 40, 40))
             bot_rect = QRect(r.x(), r.bottom() - 16, r.width(), 16)
             p.drawText(bot_rect, Qt.AlignHCenter | Qt.AlignBottom, self.sub)
         else:
@@ -546,9 +624,88 @@ class KeyboardCanvas(QWidget):
         if 0 <= idx < len(self._keys):
             self._keys[idx].set_pressed(pressed)
 
+    def set_key_mod_held(self, idx: int, held: bool):
+        if 0 <= idx < len(self._keys):
+            self._keys[idx].set_mod_held(held)
+
     def release_all(self):
         for k in self._keys:
             k.set_pressed(False)
+            k.set_mod_held(False)
+
+
+# ── Debug window ───────────────────────────────────────────────────────────
+
+class DebugWindow(QWidget):
+    """Floating log of raw evdev events and how they were resolved."""
+
+    _BTN_STYLE = """
+        QPushButton { background:#141428; color:#6070a0;
+            border:1px solid #222240; border-radius:3px; padding:0 8px; }
+        QPushButton:hover { background:#1e1e40; color:#c0c8e0; }
+    """
+
+    def __init__(self, map_getter, parent=None):
+        """map_getter: callable() → (rev_map, mod_hold_map)"""
+        super().__init__(parent, Qt.Window | Qt.WindowStaysOnTopHint)
+        self._map_getter = map_getter
+        self.setWindowTitle("Debug — Key Events")
+        self.resize(660, 400)
+        self.setStyleSheet("QWidget { background:#060610; color:#90a0b8; }")
+
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(8, 8, 8, 8)
+        vbox.setSpacing(4)
+
+        hdr = QHBoxLayout()
+        lbl = QLabel("evdev event log  ·  D to toggle")
+        lbl.setFont(QFont("Monospace", 9, QFont.Bold))
+        lbl.setStyleSheet("color:#4080c0;")
+        hdr.addWidget(lbl)
+        hdr.addStretch()
+        for text, slot in [("Dump maps", self._dump_maps), ("Clear", self._clear)]:
+            btn = QPushButton(text)
+            btn.setFont(QFont("Monospace", 8))
+            btn.setFixedHeight(22)
+            btn.setStyleSheet(self._BTN_STYLE)
+            btn.clicked.connect(slot)
+            hdr.addWidget(btn)
+        vbox.addLayout(hdr)
+
+        self._te = QTextEdit()
+        self._te.setReadOnly(True)
+        self._te.setLineWrapMode(QTextEdit.NoWrap)
+        self._te.setFont(QFont("Monospace", 9))
+        self._te.setStyleSheet(
+            "QTextEdit { background:#030308; border:1px solid #181830; }"
+        )
+        vbox.addWidget(self._te)
+
+    def log(self, html: str):
+        self._te.append(html)
+        sb = self._te.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _clear(self):
+        self._te.clear()
+
+    def _dump_maps(self):
+        if not HAS_EVDEV:
+            return
+        rev, mod = self._map_getter()
+        self.log('<span style="color:#ffa040;">──── tap reverse map ────</span>')
+        for code in sorted(rev):
+            self.log(
+                f'<span style="color:#c0b060;">&nbsp;&nbsp;'
+                f'{_evdev_name(code):20s} {code:3d} → key[{rev[code]}]</span>'
+            )
+        self.log('<span style="color:#ffa040;">──── mod-hold map ────</span>')
+        for code in sorted(mod):
+            self.log(
+                f'<span style="color:#c0b060;">&nbsp;&nbsp;'
+                f'{_evdev_name(code):20s} {code:3d} → key[{mod[code]}]</span>'
+            )
+        self.log('<span style="color:#ffa040;">──────────────────────</span>')
 
 
 # ── Main window ────────────────────────────────────────────────────────────
@@ -560,10 +717,23 @@ class MainWindow(QMainWindow):
         self._layers  = layers
         self._current = 0
 
-        # Key-highlight state: evdev_code → visual key index currently lit
+        # evdev_code → key_index for currently-pressed tap keys (yellow glow)
         self._pressed_evdev: dict = {}
-        # Reverse maps: evdev_code → key_index, one per layer
+        # evdev_code → key_index for currently-held modifier keys (red glow)
+        self._mod_held_evdev: dict = {}
+        # Auto-layer tracking: set of evdev_codes that triggered an auto layer-switch
+        self._auto_layer_evdev: set = set()
+        self._auto_layer_return: int = 0   # layer to return to when auto keys released
+        # Layer-signal tracking: evdev_code → layer_to_return_to
+        # First F2X press  = layer on  (switch to target layer, record return)
+        # Second F2X press = layer off (switch back to recorded layer)
+        self._layer_signal_on: dict = {}
+        # Debug window (created lazily on first D press)
+        self._debug_win = None
+        # Tap reverse maps: evdev_code → key_index, one per layer
         self._rev_maps = []
+        # Modifier-hold maps: unique modifier evdev_code → key_index, one per layer
+        self._mod_hold_maps = []
         self._rebuild_rev_maps()
 
         self.setWindowTitle("Charybdis Layout Viewer")
@@ -588,7 +758,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("color: #7090c0; letter-spacing: 1px; margin-bottom: 2px;")
         vbox.addWidget(title)
 
-        hint = QLabel("Hover a key for details  ·  1-9 or ← → to switch layers  ·  R to reload")
+        hint = QLabel("Hover a key for details  ·  1-9 or ← → to switch layers  ·  R to reload  ·  D to debug")
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color: #383850; font-size: 10px;")
         vbox.addWidget(hint)
@@ -696,17 +866,18 @@ class MainWindow(QMainWindow):
         )
         QShortcut(QKS("r"), self).activated.connect(self.reload_keymap)
         QShortcut(QKS("R"), self).activated.connect(self.reload_keymap)
+        QShortcut(QKS("d"), self).activated.connect(self._toggle_debug)
+        QShortcut(QKS("D"), self).activated.connect(self._toggle_debug)
 
     # ── Reverse map helpers ───────────────────────────────────────────────
 
     def _rebuild_rev_maps(self):
         if HAS_EVDEV:
-            self._rev_maps = [
-                build_reverse_map(bindings)
-                for _, bindings in self._layers
-            ]
+            self._rev_maps      = [build_reverse_map(bindings)  for _, bindings in self._layers]
+            self._mod_hold_maps = [build_mod_hold_map(bindings) for _, bindings in self._layers]
         else:
-            self._rev_maps = []
+            self._rev_maps      = []
+            self._mod_hold_maps = []
 
     def _current_rev_map(self) -> dict:
         if self._rev_maps and self._current < len(self._rev_maps):
@@ -715,6 +886,24 @@ class MainWindow(QMainWindow):
 
     def _base_rev_map(self) -> dict:
         return self._rev_maps[0] if self._rev_maps else {}
+
+    def _current_mod_hold_map(self) -> dict:
+        if self._mod_hold_maps and self._current < len(self._mod_hold_maps):
+            return self._mod_hold_maps[self._current]
+        return {}
+
+    def _base_mod_hold_map(self) -> dict:
+        return self._mod_hold_maps[0] if self._mod_hold_maps else {}
+
+    def _find_layer_for_code(self, evdev_code: int) -> int | None:
+        """Return the first non-base layer that contains evdev_code, if absent from base."""
+        base_rev = self._rev_maps[0] if self._rev_maps else {}
+        if evdev_code in base_rev:
+            return None  # in base already, no need to auto-switch
+        for layer_idx in range(1, len(self._rev_maps)):
+            if evdev_code in self._rev_maps[layer_idx]:
+                return layer_idx
+        return None
 
     # ── Layer switching ───────────────────────────────────────────────────
 
@@ -725,6 +914,12 @@ class MainWindow(QMainWindow):
         # Release currently highlighted keys before switching
         for key_idx in self._pressed_evdev.values():
             self._kb.set_key_pressed(key_idx, False)
+        for key_idx in self._mod_held_evdev.values():
+            self._kb.set_key_mod_held(key_idx, False)
+        self._mod_held_evdev.clear()
+        # Cancel auto-layer and signal tracking (manual switch takes over)
+        self._auto_layer_evdev.clear()
+        self._layer_signal_on.clear()
 
         self._current = idx
         for i, btn in enumerate(self._tab_btns):
@@ -754,19 +949,148 @@ class MainWindow(QMainWindow):
     # ── Key event from evdev thread ───────────────────────────────────────
 
     def on_key_event(self, evdev_code: int, pressed: bool):
+        self._debug_event(evdev_code, pressed)   # log before state changes
         if pressed:
+            # ── Layer-signal keys (F20-F24 from ZMK signaled layer macros) ──
+            if HAS_EVDEV and evdev_code in LAYER_SIGNAL_CODES:
+                target = LAYER_SIGNAL_CODES[evdev_code]
+                if evdev_code not in self._layer_signal_on:
+                    # First press → switch to the signaled layer
+                    self._layer_signal_on[evdev_code] = self._current
+                    if self._current != target:
+                        _saved = dict(self._layer_signal_on)
+                        self.switch_layer(target)
+                        self._layer_signal_on = _saved
+                else:
+                    # Second press → return to previous layer
+                    ret = self._layer_signal_on.pop(evdev_code)
+                    self.switch_layer(ret)
+                return   # consumed — don't fall through to tap/mod logic
+
+            # Check tap key codes first (regular keys + &hm tap + &lt/lts tap)
             rev  = self._current_rev_map()
             base = self._base_rev_map()
             _r = rev.get(evdev_code); key_idx = _r if _r is not None else base.get(evdev_code)
             if key_idx is not None:
                 self._pressed_evdev[evdev_code] = key_idx
                 self._kb.set_key_pressed(key_idx, True)
+            else:
+                # Check if ZMK sent a modifier from a unique &hm hold
+                mod_map  = self._current_mod_hold_map()
+                base_mod = self._base_mod_hold_map()
+                _m = mod_map.get(evdev_code); mod_idx = _m if _m is not None else base_mod.get(evdev_code)
+                if mod_idx is not None:
+                    self._mod_held_evdev[evdev_code] = mod_idx
+                    self._kb.set_key_mod_held(mod_idx, True)
+                else:
+                    # Key from a non-base layer — user must be holding an &lt key.
+                    # Auto-switch the visualizer to that layer.
+                    layer_idx = self._find_layer_for_code(evdev_code)
+                    if layer_idx is not None:
+                        if not self._auto_layer_evdev:          # first auto key
+                            self._auto_layer_return = self._current
+                        self._auto_layer_evdev.add(evdev_code)
+                        if self._current != layer_idx:
+                            # Save auto state — switch_layer clears it
+                            _saved_auto   = set(self._auto_layer_evdev)
+                            _saved_return = self._auto_layer_return
+                            self.switch_layer(layer_idx)
+                            self._auto_layer_evdev  = _saved_auto
+                            self._auto_layer_return = _saved_return
+                        _r2 = self._current_rev_map().get(evdev_code)
+                        if _r2 is not None:
+                            self._pressed_evdev[evdev_code] = _r2
+                            self._kb.set_key_pressed(_r2, True)
         else:
             key_idx = self._pressed_evdev.pop(evdev_code, None)
             if key_idx is not None:
-                # Only clear if no other pressed key is mapped to same position
                 if key_idx not in self._pressed_evdev.values():
                     self._kb.set_key_pressed(key_idx, False)
+            mod_idx = self._mod_held_evdev.pop(evdev_code, None)
+            if mod_idx is not None:
+                if mod_idx not in self._mod_held_evdev.values():
+                    self._kb.set_key_mod_held(mod_idx, False)
+            # If this was an auto-layer key, return to the previous layer when all released
+            if evdev_code in self._auto_layer_evdev:
+                self._auto_layer_evdev.discard(evdev_code)
+                if not self._auto_layer_evdev:
+                    self.switch_layer(self._auto_layer_return)
+
+    # ── Debug ─────────────────────────────────────────────────────────────
+
+    def _toggle_debug(self):
+        if not HAS_EVDEV:
+            return
+        if self._debug_win is None:
+            self._debug_win = DebugWindow(
+                map_getter=lambda: (self._current_rev_map(), self._current_mod_hold_map())
+            )
+        if self._debug_win.isVisible():
+            self._debug_win.hide()
+        else:
+            self._debug_win.show()
+            self._debug_win.raise_()
+
+    def _debug_event(self, evdev_code: int, pressed: bool):
+        if self._debug_win is None or not self._debug_win.isVisible():
+            return
+        ts   = time.strftime("%H:%M:%S")
+        arr  = '<span style="color:#60e060;">▼</span>' if pressed else '<span style="color:#406040;">▲</span>'
+        name = _evdev_name(evdev_code)
+        code_html = f'<span style="color:#a0a8c0;">{name} ({evdev_code})</span>'
+
+        if pressed:
+            if HAS_EVDEV and evdev_code in LAYER_SIGNAL_CODES:
+                target = LAYER_SIGNAL_CODES[evdev_code]
+                lname  = LAYER_DEFS[target][1] if target < len(LAYER_DEFS) else f"L{target}"
+                if evdev_code not in self._layer_signal_on:
+                    action = (f'<span style="color:#00e0c0;">⟵ layer signal ON  '
+                              f'→ layer {target} ({lname})</span>')
+                else:
+                    ret = self._layer_signal_on.get(evdev_code, 0)
+                    ret_name = LAYER_DEFS[ret][1] if ret < len(LAYER_DEFS) else f"L{ret}"
+                    action = (f'<span style="color:#00a090;">⟶ layer signal OFF '
+                              f'→ return to layer {ret} ({ret_name})</span>')
+                self._debug_win.log(
+                    f'<span style="color:#505060;">{ts}</span> {arr} {code_html} &nbsp; {action}'
+                )
+                return
+
+            rev  = self._current_rev_map()
+            base = self._base_rev_map()
+            _r = rev.get(evdev_code); key_idx = _r if _r is not None else base.get(evdev_code)
+            if key_idx is not None:
+                bindings = self._layers[self._current][1] if self._current < len(self._layers) else []
+                label = bindings[key_idx].strip() if key_idx < len(bindings) else "?"
+                action = f'<span style="color:#f0e040;">→ key[{key_idx}] {label}  tap/yellow</span>'
+            else:
+                mod_map  = self._current_mod_hold_map()
+                base_mod = self._base_mod_hold_map()
+                _m = mod_map.get(evdev_code); mod_idx = _m if _m is not None else base_mod.get(evdev_code)
+                if mod_idx is not None:
+                    bindings = self._layers[self._current][1] if self._current < len(self._layers) else []
+                    label = bindings[mod_idx].strip() if mod_idx < len(bindings) else "?"
+                    action = f'<span style="color:#ff7050;">→ key[{mod_idx}] {label}  mod-hold/red</span>'
+                else:
+                    layer_idx = self._find_layer_for_code(evdev_code)
+                    if layer_idx is not None:
+                        lname = LAYER_DEFS[layer_idx][1] if layer_idx < len(LAYER_DEFS) else f"L{layer_idx}"
+                        action = f'<span style="color:#40a0ff;">⟳ auto-switch → layer {layer_idx} ({lname})</span>'
+                    else:
+                        action = '<span style="color:#604040;">✗ not in any layer map</span>'
+        else:
+            if evdev_code in self._pressed_evdev:
+                ki = self._pressed_evdev[evdev_code]
+                action = f'<span style="color:#808050;">→ key[{ki}]  released tap</span>'
+            elif evdev_code in self._mod_held_evdev:
+                mi = self._mod_held_evdev[evdev_code]
+                action = f'<span style="color:#806040;">→ key[{mi}]  released mod-hold</span>'
+            else:
+                action = '<span style="color:#383840;">released (untracked)</span>'
+
+        self._debug_win.log(
+            f'<span style="color:#505060;">{ts}</span> {arr} {code_html} &nbsp; {action}'
+        )
 
     # ── Reload ────────────────────────────────────────────────────────────
 
@@ -776,6 +1100,9 @@ class MainWindow(QMainWindow):
             self._rebuild_rev_maps()
             self._kb.release_all()
             self._pressed_evdev.clear()
+            self._mod_held_evdev.clear()
+            self._auto_layer_evdev.clear()
+            self._layer_signal_on.clear()
             self.switch_layer(self._current)
             self.setWindowTitle("Charybdis Layout Viewer  ✓ reloaded")
         except Exception as e:
@@ -827,6 +1154,7 @@ def main():
         print("       Fix: sudo apt install python3-evdev")
 
     win.show()
+    win._toggle_debug()   # open debug window at startup
     sys.exit(app.exec_())
 
 
