@@ -334,7 +334,8 @@ if HAS_EVDEV:
 
     class KeyListener(QThread):
         """Background thread: reads evdev events and emits key_event signals."""
-        key_event = pyqtSignal(int, bool)   # (evdev_keycode, is_pressed)
+        key_event     = pyqtSignal(int, bool)  # (evdev_keycode, is_pressed)
+        status_signal = pyqtSignal(str, str)   # (message, color_hex)
 
         def __init__(self, parent=None):
             super().__init__(parent)
@@ -361,11 +362,14 @@ if HAS_EVDEV:
                     pass
 
             if not devices:
-                print(
-                    "[KeyListener] no keyboard devices accessible — highlighting disabled\n"
-                    "  Fix: sudo usermod -aG input $USER  then log out and back in"
+                self.status_signal.emit(
+                    "○ no keyboard access — run: sudo usermod -aG input $USER  then log out/in",
+                    "#804040",
                 )
                 return
+
+            names = ", ".join(d.name for d in devices)
+            self.status_signal.emit(f"● listening: {names}", "#40a060")
 
             while self._running:
                 try:
@@ -589,6 +593,11 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet("color: #383850; font-size: 10px;")
         vbox.addWidget(hint)
 
+        self._kb_status = QLabel("○ key highlighting inactive")
+        self._kb_status.setAlignment(Qt.AlignCenter)
+        self._kb_status.setStyleSheet("color: #804040; font-size: 10px;")
+        vbox.addWidget(self._kb_status)
+
         tab_row = QHBoxLayout()
         tab_row.setSpacing(4)
         self._tab_btns = []
@@ -736,7 +745,7 @@ class MainWindow(QMainWindow):
         rev = self._current_rev_map()
         base = self._base_rev_map()
         for evdev_code in self._pressed_evdev:
-            key_idx = rev.get(evdev_code) or base.get(evdev_code)
+            _r = rev.get(evdev_code); key_idx = _r if _r is not None else base.get(evdev_code)
             if key_idx is not None:
                 self._kb.set_key_pressed(key_idx, True)
                 new_pressed[evdev_code] = key_idx
@@ -748,7 +757,7 @@ class MainWindow(QMainWindow):
         if pressed:
             rev  = self._current_rev_map()
             base = self._base_rev_map()
-            key_idx = rev.get(evdev_code) or base.get(evdev_code)
+            _r = rev.get(evdev_code); key_idx = _r if _r is not None else base.get(evdev_code)
             if key_idx is not None:
                 self._pressed_evdev[evdev_code] = key_idx
                 self._kb.set_key_pressed(key_idx, True)
@@ -805,6 +814,12 @@ def main():
     if HAS_EVDEV:
         listener = KeyListener()
         listener.key_event.connect(win.on_key_event)
+        listener.status_signal.connect(
+            lambda msg, col: (
+                win._kb_status.setText(msg),
+                win._kb_status.setStyleSheet(f"color: {col}; font-size: 10px;"),
+            )
+        )
         listener.start()
         app.aboutToQuit.connect(listener.stop)
     else:
