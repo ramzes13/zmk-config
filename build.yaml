@@ -19,13 +19,13 @@
 #
 ---
 include:
-  - board: nice_nano/nrf52840
+  - board: nice_nano//zmk
     shield: charybdis_dongle
     # snippet: studio-rpc-usb-uart
     # cmake-args: -DCONFIG_ZMK_STUDIO=y
-  - board: nice_nano/nrf52840
+  - board: nice_nano//zmk
     shield: charybdis_left
-  - board: nice_nano/nrf52840
+  - board: nice_nano//zmk
     shield: charybdis_right
-  - board: nice_nano/nrf52840
+  - board: nice_nano//zmk
     shield: settings_reset
