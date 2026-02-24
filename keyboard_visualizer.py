@@ -400,54 +400,116 @@ if HAS_EVDEV:
         return raw.replace("KEY_", "")
 
     class KeyListener(QThread):
-        """Background thread: reads evdev events and emits key_event signals."""
+        """Background thread: reads evdev events and emits key_event signals.
+
+        Watches only the ZMK Charybdis keyboard (device name must contain
+        'charybdis', case-insensitive).  Automatically reconnects when the
+        dongle reboots — rescans /dev/input/event* every RESCAN_INTERVAL
+        seconds and subscribes to any newly-appearing Charybdis device.
+        """
         key_event     = pyqtSignal(int, bool)  # (evdev_keycode, is_pressed)
         status_signal = pyqtSignal(str, str)   # (message, color_hex)
+        device_lost   = pyqtSignal()           # emitted when Charybdis disconnects
+
+        RESCAN_INTERVAL = 2.0   # seconds between /dev/input rescans
+        DEVICE_KEYWORD  = "charybdis"
 
         def __init__(self, parent=None):
             super().__init__(parent)
             self._running = True
 
-        def run(self):
-            # evdev.list_devices() filters for r+w access, but we only need read.
-            # Scan /dev/input/event* directly so group membership is enough.
-            import glob
-            all_paths = sorted(glob.glob("/dev/input/event*"))
+        # ------------------------------------------------------------------
+        # helpers
+        # ------------------------------------------------------------------
+        def _is_charybdis(self, dev: "evdev.InputDevice") -> bool:
+            return self.DEVICE_KEYWORD in dev.name.lower()
 
-            devices = []
-            for path in all_paths:
+        def _open_charybdis_devices(self) -> dict:
+            """Return {path: InputDevice} for every Charybdis event node found."""
+            import glob
+            found = {}
+            for path in sorted(glob.glob("/dev/input/event*")):
                 try:
                     dev = evdev.InputDevice(path)
-                    caps = dev.capabilities()
-                    keys = caps.get(EC.EV_KEY, [])
-                    if EC.KEY_A in keys and EC.KEY_Z in keys:
-                        devices.append(dev)
-                        print(f"[KeyListener] monitoring: {dev.name}")
+                    if self._is_charybdis(dev):
+                        found[path] = dev
+                        print(f"[KeyListener] found: {dev.name} ({path})")
                 except PermissionError:
-                    pass   # silently skip — user may not have input group yet
+                    pass
                 except Exception:
                     pass
+            return found
 
-            if not devices:
+        def _update_status(self, devices: dict) -> None:
+            if devices:
+                names = ", ".join(d.name for d in devices.values())
+                self.status_signal.emit(f"● listening: {names}", "#40a060")
+            else:
                 self.status_signal.emit(
-                    "○ no keyboard access — run: sudo usermod -aG input $USER  then log out/in",
+                    f"○ waiting for ZMK keyboard ({self.DEVICE_KEYWORD})…", "#806040"
+                )
+
+        # ------------------------------------------------------------------
+        # main loop
+        # ------------------------------------------------------------------
+        def run(self):
+            import glob, time
+
+            # Check whether we can open any input device at all (permissions).
+            try:
+                all_paths = sorted(glob.glob("/dev/input/event*"))
+                if all_paths:
+                    evdev.InputDevice(all_paths[0])   # probe first device
+            except PermissionError:
+                self.status_signal.emit(
+                    "○ no input access — run: sudo usermod -aG input $USER  then log out/in",
                     "#804040",
                 )
                 return
+            except Exception:
+                pass
 
-            names = ", ".join(d.name for d in devices)
-            self.status_signal.emit(f"● listening: {names}", "#40a060")
+            devices: dict = self._open_charybdis_devices()
+            self._update_status(devices)
+
+            last_rescan = time.monotonic()
 
             while self._running:
                 try:
-                    readable, _, _ = select.select(devices, [], [], 0.1)
+                    dev_list = list(devices.values())
+                    readable, _, _ = select.select(dev_list, [], [], 0.1)
+
+                    # ── read available events ──────────────────────────────
                     for dev in readable:
                         try:
                             for ev in dev.read():
                                 if ev.type == EC.EV_KEY and ev.value in (0, 1):
                                     self.key_event.emit(ev.code, ev.value == 1)
                         except OSError:
-                            devices.remove(dev)
+                            # Device disconnected (dongle rebooted, USB pulled…)
+                            path = dev.path
+                            print(f"[KeyListener] lost: {dev.name} ({path})")
+                            devices.pop(path, None)
+                            self.device_lost.emit()
+                            self._update_status(devices)
+
+                    # ── periodic rescan for newly connected Charybdis ──────
+                    now = time.monotonic()
+                    if now - last_rescan >= self.RESCAN_INTERVAL:
+                        last_rescan = now
+                        new_paths = sorted(glob.glob("/dev/input/event*"))
+                        for path in new_paths:
+                            if path in devices:
+                                continue   # already tracking
+                            try:
+                                dev = evdev.InputDevice(path)
+                                if self._is_charybdis(dev):
+                                    devices[path] = dev
+                                    print(f"[KeyListener] reconnected: {dev.name} ({path})")
+                                    self._update_status(devices)
+                            except Exception:
+                                pass
+
                 except Exception:
                     pass
 
@@ -1086,13 +1148,34 @@ class MainWindow(QMainWindow):
                 mi = self._mod_held_evdev[evdev_code]
                 action = f'<span style="color:#806040;">→ key[{mi}]  released mod-hold</span>'
             else:
-                action = '<span style="color:#383840;">released (untracked)</span>'
+                return   # untracked release — BLE dropout ghost, silently ignore
 
         self._debug_win.log(
             f'<span style="color:#505060;">{ts}</span> {arr} {code_html} &nbsp; {action}'
         )
 
+    # ── Device lost ───────────────────────────────────────────────────────
+
+    def on_device_lost(self):
+        """Called when the Charybdis dongle disconnects.  Release all visual
+        key state so no keys stay lit while the keyboard is gone."""
+        self._kb.release_all()
+        self._pressed_evdev.clear()
+        self._mod_held_evdev.clear()
+        self._auto_layer_evdev.clear()
+        self._layer_signal_on.clear()
+        if self._debug_win is not None and self._debug_win.isVisible():
+            ts = time.strftime("%H:%M:%S")
+            self._debug_win.log(
+                f'<span style="color:#505060;">{ts}</span>'
+                f' <span style="color:#c04040;">⚡ dongle disconnected — all keys released</span>'
+            )
+
     # ── Reload ────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        QApplication.quit()
+        event.accept()
 
     def reload_keymap(self):
         try:
@@ -1141,6 +1224,7 @@ def main():
     if HAS_EVDEV:
         listener = KeyListener()
         listener.key_event.connect(win.on_key_event)
+        listener.device_lost.connect(win.on_device_lost)
         listener.status_signal.connect(
             lambda msg, col: (
                 win._kb_status.setText(msg),
